@@ -8,18 +8,22 @@ import logging
 import subprocess
 import pyinotify
 import signal
+import asyncio
+from urllib.request import urlopen
+import zipfile
+from io import BytesIO
 from typing import List, Set
 
-TMP_DIR = '/tmp/bsp'
+TMP_DIR = '/tmp/bsp-casefolding-workaround'
 HISTORY_FILE = 'extracted_maps.txt'
+VPKEDITCLI_PATH = None 
 
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(message)s',
     handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('bsp_processor.log')
+        logging.StreamHandler()
     ]
 )
 logger = logging.getLogger('BSPProcessor')
@@ -31,8 +35,11 @@ running = True
 def signal_handler(sig, frame):
     """Handle termination signals for graceful shutdown"""
     global running
+    loop = asyncio.get_event_loop()
     logger.info("Received termination signal. Shutting down...")
     running = False
+    sys.exit(1)
+    
 
 
 # Register signal handlers
@@ -60,19 +67,19 @@ class BSPEventHandler(pyinotify.ProcessEvent):
             self.pending_files[event.pathname] = time.time()
 
 
-    def process_pending_files(self):
+    async def process_pending_files(self):
         """Process files"""
         files = []
         if len(self.pending_files) > 0:
             files = list(self.pending_files.keys())
-            process_bsp(files, self.path)
+            await process_bsp(files, self.path)
 
         # Remove processed files from pending list
         for file_path in files:
             del self.pending_files[file_path]
 
 
-def find_bsp_files(source_path: str) -> List[str]:
+async def find_bsp_files(source_path: str) -> List[str]:
     """
     Recursively find all BSP files in the given directory.
 
@@ -103,7 +110,7 @@ def find_bsp_files(source_path: str) -> List[str]:
     return sorted(bsp_files)
 
 
-def process_bsp(bsp_files: List[str], data_path: str) -> None:
+async def process_bsp(bsp_files: List[str], data_path: str) -> None:
     """
     Process BSP files by extracting them and moving all resulting directories to steampath.
     Tracks processed files in a history file to avoid reprocessing.
@@ -154,16 +161,21 @@ def process_bsp(bsp_files: List[str], data_path: str) -> None:
 
         # Extract BSP contents using vpkeditcli
         try:
-            result = subprocess.run(
-                ["vpkeditcli", "--output", TMP_DIR, "--extract", "/", bsp],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
+            bsp = bsp.replace(" ", "\ ")
+
+            result = await asyncio.create_subprocess_shell(f"{VPKEDITCLI_PATH} --output {TMP_DIR} --extract / {bsp}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
+            
+            await result.communicate()
+            
             if result.returncode != 0:
                 logger.info(f"\nWarning: Failed to extract '{bsp_name}', skipping.")
                 time.sleep(1)
                 continue
         except Exception as e:
+            print("== EXCEPTION HERE")
             logger.info(f"\nWarning: Failed to extract '{bsp_name}': {e}, skipping.")
             time.sleep(1)
             continue
@@ -183,7 +195,12 @@ def process_bsp(bsp_files: List[str], data_path: str) -> None:
                     dst_dir = os.path.join(data_path, item)
 
                     # Create destination directory if it doesn't exist
-                    os.makedirs(dst_dir, exist_ok=True)
+                    try:
+                        os.makedirs(dst_dir, exist_ok=True)
+                    except OSError as e:
+                        logger.info(f"\nWarning: Failed to extract '{bsp_name}': {e}, skipping.")
+                        time.sleep(1)
+                        continue
 
                     # Move all files from source to destination
                     for root, dirs, files in os.walk(src_dir):
@@ -231,13 +248,13 @@ def process_bsp(bsp_files: List[str], data_path: str) -> None:
             logger.info(f"Warning: Failed to update history file: {e}")
 
 
-def watch_directory(download_dir: str):
+async def watch_directory(download_dir: str):
     source_path = os.path.join(download_dir, 'maps')
 
     # Process existing files first
-    existing_files = find_bsp_files(source_path)
+    existing_files = await find_bsp_files(source_path)
     if existing_files:
-        process_bsp(existing_files, download_dir)
+        await process_bsp(existing_files, download_dir)
 
     # Set up the watch manager
     wm = pyinotify.WatchManager()
@@ -263,7 +280,7 @@ def watch_directory(download_dir: str):
                 notifier.process_events()
 
             # Process any pending files
-            handler.process_pending_files()
+            await handler.process_pending_files()
 
     except Exception as e:
         logger.error(f"Error in watch loop: {e}")
@@ -272,9 +289,30 @@ def watch_directory(download_dir: str):
         notifier.stop()
         logger.info("Watcher stopped")
 
-
-if __name__ == "__main__":
+def main():
     if not os.path.isdir(TMP_DIR):
         os.makedirs(TMP_DIR)
+    
+    which_result = shutil.which("vpkeditcli")
+    if which_result is None:
+        logger.error("cannot find vpkeditcli, exiting...");
+        sys.exit(1);
+    
+    print(f"found vpkeditcli at {which_result}")
+    
+    global VPKEDITCLI_PATH
+    VPKEDITCLI_PATH = which_result
 
-    watch_directory(sys.argv[1])
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        for arg in sys.argv:
+            print(arg)
+            if arg not in ["python", "./__init__.py"]:
+                asyncio.ensure_future(watch_directory(arg))
+        loop.run_forever()
+    finally:
+        loop.close()
+
+if __name__ == "__main__":
+    main()
