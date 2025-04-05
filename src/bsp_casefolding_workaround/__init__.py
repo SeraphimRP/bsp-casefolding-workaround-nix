@@ -1,18 +1,13 @@
-#!/usr/bin/python
-
 import os
 import sys
 import time
 import shutil
 import logging
-import subprocess
 import pyinotify
 import signal
 import asyncio
-from urllib.request import urlopen
-import zipfile
-from io import BytesIO
 from typing import List, Set
+from pathlib import Path
 
 TMP_DIR = '/tmp/bsp-casefolding-workaround'
 HISTORY_FILE = 'extracted_maps.txt'
@@ -38,7 +33,7 @@ def signal_handler(sig, frame):
     loop = asyncio.get_event_loop()
     logger.info("Received termination signal. Shutting down...")
     running = False
-    sys.exit(1)
+    sys.exit(0)
     
 
 
@@ -50,20 +45,20 @@ signal.signal(signal.SIGTERM, signal_handler)
 class BSPEventHandler(pyinotify.ProcessEvent):
     """Event handler for BSP file events"""
 
-    def __init__(self, download_dir: str):
-        self.path = download_dir
+    def __init__(self, download_dirs: List[str]):
+        self.paths = download_dirs
         self.pending_files = {}
 
     def process_IN_CLOSE_WRITE(self, event):
         """Process event when a file is closed after writing"""
         if event.pathname.lower().endswith('.bsp'):
-            logger.info(f"New BSP file detected: {event.name}")
+            logger.info(f"New BSP file detected: {event.pathname}")
             self.pending_files[event.pathname] = time.time()
 
     def process_IN_MOVED_TO(self, event):
         """Process event when a file is moved into the watched directory"""
         if event.pathname.lower().endswith('.bsp'):
-            logger.info(f"BSP file moved: {event.name}")
+            logger.info(f"BSP file moved: {event.pathname}")
             self.pending_files[event.pathname] = time.time()
 
 
@@ -72,7 +67,7 @@ class BSPEventHandler(pyinotify.ProcessEvent):
         files = []
         if len(self.pending_files) > 0:
             files = list(self.pending_files.keys())
-            await process_bsp(files, self.path)
+            await process_bsp(files, self.paths)
 
         # Remove processed files from pending list
         for file_path in files:
@@ -91,8 +86,6 @@ async def find_bsp_files(source_path: str) -> List[str]:
     """
     bsp_files = []
 
-    logger.info(f"Scanning for BSP files in: {source_path}")
-
     try:
         # Walk through the directory tree
         for root, _, files in os.walk(source_path):
@@ -102,15 +95,15 @@ async def find_bsp_files(source_path: str) -> List[str]:
                     bsp_path = os.path.join(root, file)
                     bsp_files.append(os.path.abspath(bsp_path))
 
-        logger.info(f"Found {len(bsp_files)} BSP files")
+        logger.info(f"Found {len(bsp_files)} BSP files in {source_path}")
     except Exception as e:
-        logger.info(f"Error scanning for BSP files: {e}")
+        logger.info(f"Error scanning for BSP files in {source_path}: {e}")
 
     # Sort files for consistent processing order
     return sorted(bsp_files)
 
 
-async def process_bsp(bsp_files: List[str], data_path: str) -> None:
+async def process_bsp(bsp_files: List[str], data_paths: List[str]) -> None:
     """
     Process BSP files by extracting them and moving all resulting directories to steampath.
     Tracks processed files in a history file to avoid reprocessing.
@@ -120,30 +113,31 @@ async def process_bsp(bsp_files: List[str], data_path: str) -> None:
         data_path: Path where BSP contents will be extracted
     """
     # Load history of processed BSP files
-
-    history_file = os.path.join(data_path, HISTORY_FILE)
-
     processed_history: Set[str] = set()
-    if os.path.exists(history_file):
-        try:
-            with open(history_file, 'r') as f:
-                processed_history = set(line.strip() for line in f if line.strip())
-        except Exception as e:
-            logger.info(f"Warning: Could not read history file: {e}")
+
+    for data_path in data_paths:
+        history_file = os.path.join(Path(data_path).parent, HISTORY_FILE)
+
+        if os.path.exists(history_file):
+            try:
+                with open(history_file, 'r') as f:
+                    processed_history.update(set(line.strip() for line in f if line.strip()))
+            except Exception as e:
+                logger.info(f"Warning: Could not read history file: {e}")
 
     # Filter out already processed files
     files_to_process = []
     for bsp in bsp_files:
-        bsp_name = os.path.basename(bsp)
+        bsp_name = bsp
         if bsp_name in processed_history:
-            logger.info(f"Already processed file: {os.path.basename(bsp)}")
+            logger.info(f"Already processed file: {bsp}")
         else:
             files_to_process.append(bsp)
 
     if not files_to_process:
         logger.info("No new BSP files to process.")
         return
-
+    
     # Track newly processed files
     newly_processed = set()
 
@@ -157,13 +151,11 @@ async def process_bsp(bsp_files: List[str], data_path: str) -> None:
         bsp_processed += 1
 
         # Progress message
-        logger.info(f"Processing Maps {bsp_processed}/{bsp_total} {(bsp_processed * 100 // bsp_total)}% {os.path.splitext(bsp_name)[0]}")
+        logger.info(f"Processing map {bsp_processed} of {bsp_total} ({(bsp_processed * 100 // bsp_total)}%), path: {bsp}")
 
         # Extract BSP contents using vpkeditcli
         try:
-            bsp = bsp.replace(" ", "\ ")
-
-            result = await asyncio.create_subprocess_shell(f"{VPKEDITCLI_PATH} --output {TMP_DIR} --extract / {bsp}",
+            result = await asyncio.create_subprocess_shell(f"{VPKEDITCLI_PATH} --output {TMP_DIR} --extract / {bsp.replace(" ", "\ ")}",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
@@ -175,13 +167,13 @@ async def process_bsp(bsp_files: List[str], data_path: str) -> None:
                 time.sleep(1)
                 continue
         except Exception as e:
-            print("== EXCEPTION HERE")
             logger.info(f"\nWarning: Failed to extract '{bsp_name}': {e}, skipping.")
             time.sleep(1)
             continue
 
         # Setup base path for extracted content
         bsp_base_name = os.path.splitext(bsp_name)[0]
+        data_path = Path(bsp).parent.parent
         bsp_extract_dir = os.path.join(TMP_DIR, bsp_base_name)
 
         # Get all directories in the extracted folder
@@ -227,38 +219,54 @@ async def process_bsp(bsp_files: List[str], data_path: str) -> None:
             shutil.rmtree(bsp_extract_dir)
 
             # Mark as successfully processed
-            newly_processed.add(bsp_name)
+            newly_processed.add(bsp)
 
-        time.sleep(0.25)
         sys.stdout.flush()
 
     # Update history file with newly processed files
     if newly_processed:
         try:
-            # Write to a temporary file first to ensure atomic update
-            temp_history_file = f"{history_file}.tmp"
-            with open(temp_history_file, 'w') as f:
-                for bsp_path in sorted(processed_history.union(newly_processed)):
-                    f.write(f"{bsp_path}\n")
+            for data_path in data_paths:
+                count = 0
 
-            # Replace the original file with the updated one
-            shutil.move(temp_history_file, history_file)
-            logger.info(f"Updated history file with {len(newly_processed)} newly processed BSP files.")
+                # Write to a temporary file first to ensure atomic update
+                temp_history_file = f"{history_file}.tmp"
+                with open(temp_history_file, 'w') as f:
+                    for bsp_path in sorted(processed_history.union(newly_processed)):
+                        if Path(data_path).parent == Path(bsp_path).parent.parent:
+                            f.write(f"{bsp_path}\n")
+                            count += 1
+
+                if count != 0:
+                    # Replace the original file with the updated one
+                    shutil.move(temp_history_file, os.path.join(Path(data_path).parent, HISTORY_FILE))
+                    logger.info(f"Updated {os.path.join(Path(data_path).parent, HISTORY_FILE)} with {count} newly processed BSP files.")
         except Exception as e:
             logger.info(f"Warning: Failed to update history file: {e}")
 
 
-async def watch_directory(download_dir: str):
-    source_path = os.path.join(download_dir, 'maps')
+async def watch_directory(download_dirs: List[str]):
+    source_paths = [os.path.join(download_dir, 'maps') for download_dir in download_dirs]
+    initial_source_paths = source_paths
+    existing_files = None
 
     # Process existing files first
-    existing_files = await find_bsp_files(source_path)
-    if existing_files:
-        await process_bsp(existing_files, download_dir)
+    for source_path in source_paths:
+        tmp_existing_files = await find_bsp_files(source_path)
+
+        if not tmp_existing_files:
+            initial_source_paths.remove(source_path)
+        else:
+            if existing_files is None:
+                existing_files = tmp_existing_files
+            else:
+                existing_files += tmp_existing_files
+        
+    await process_bsp(existing_files, initial_source_paths)
 
     # Set up the watch manager
     wm = pyinotify.WatchManager()
-    handler = BSPEventHandler(download_dir)
+    handler = BSPEventHandler(source_paths)
 
     # Set up the notifier
     notifier = pyinotify.Notifier(wm, handler)
@@ -267,8 +275,9 @@ async def watch_directory(download_dir: str):
     mask = pyinotify.IN_CLOSE_WRITE | pyinotify.IN_MOVED_TO | pyinotify.IN_CREATE
 
     # Recursively add watches to all subdirectories
-    wm.add_watch(source_path, mask)
-    logger.info(f"Watching directory: {source_path}")
+    for source_path in source_paths:
+        wm.add_watch(source_path, mask)
+        logger.info(f"Watching directory: {source_path}")
     logger.info("Press Ctrl+C to stop")
 
     # Main loop
@@ -281,7 +290,6 @@ async def watch_directory(download_dir: str):
 
             # Process any pending files
             await handler.process_pending_files()
-
     except Exception as e:
         logger.error(f"Error in watch loop: {e}")
     finally:
@@ -298,19 +306,21 @@ def main():
         logger.error("cannot find vpkeditcli, exiting...");
         sys.exit(1);
     
-    print(f"found vpkeditcli at {which_result}")
-    
     global VPKEDITCLI_PATH
     VPKEDITCLI_PATH = which_result
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
+    watching_directories = []
     try:
         for arg in sys.argv:
-            print(arg)
-            if arg not in ["python", "./__init__.py"]:
-                asyncio.ensure_future(watch_directory(arg))
+            if "bin/bsp-casefolding-workaround" not in arg and arg not in ["python", "__init__.py"]:
+                watching_directories.append(arg)
+        asyncio.ensure_future(watch_directory(watching_directories))
         loop.run_forever()
+    except Exception as e:
+        logger.error(f"received exception: {e}")
     finally:
         loop.close()
 

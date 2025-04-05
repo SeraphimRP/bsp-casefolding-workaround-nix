@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bsp-casefolding-workaround"
+version = "1.0.0"
+description = "A utility for automatically extracting and processing BSP map files."
+readme = "README.md"
+requires-python = ">=3.13"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Andrey Gridchin", email = "gedweb89@gmail.com" },
+    { name = "Seraphim Pardee", email = "me@srp.life" }
+]
+maintainers = [
+    { name = "Seraphim Pardee", email = "me@srp.life" }
+]
+dependencies = [
+    "pyinotify-elephant-fork == 0.0.1",
+]
+
+[project.urls]
+"Source" = "https://github.com/SeraphimRP/bsp-casefolding-workaround-nix"
+
+[project.scripts]
+bsp-casefolding-workaround = "bsp_casefolding_workaround:main"
